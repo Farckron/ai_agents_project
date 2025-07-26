@@ -1,5 +1,6 @@
 from openai import OpenAI
 
+from config.settings import Config
 client = OpenAI(api_key=Config.OPENAI_API_KEY)
 import logging
 from abc import ABC, abstractmethod

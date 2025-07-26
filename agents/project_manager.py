@@ -4,6 +4,7 @@ from .prompt_ask_engineer import PromptAskEngineer
 from .prompt_code_engineer import PromptCodeEngineer
 from .code_agent import CodeAgent
 from .github_manager import GitHubManager
+from .pr_manager import PRManager
 
 class ProjectManager(BaseAgent):
     def __init__(self):
@@ -14,6 +15,7 @@ class ProjectManager(BaseAgent):
         self.prompt_code_engineer = PromptCodeEngineer()
         self.code_agent = CodeAgent()
         self.github_manager = GitHubManager()
+        self.pr_manager = PRManager()
         
         # Task tracking
         self.current_tasks: List[Dict[str, Any]] = []
@@ -143,7 +145,8 @@ class ProjectManager(BaseAgent):
                 'prompt_ask_engineer': self.prompt_ask_engineer.get_status(),
                 'prompt_code_engineer': self.prompt_code_engineer.get_status(),
                 'code_agent': self.code_agent.get_status(),
-                'github_manager': self.github_manager.get_status()
+                'github_manager': self.github_manager.get_status(),
+                'pr_manager': self.pr_manager.get_status()
             },
             'current_tasks': len(self.current_tasks),
             'completed_tasks': len(self.completed_tasks)
@@ -166,3 +169,69 @@ class ProjectManager(BaseAgent):
             self.current_tasks.remove(task)
         
         return result
+    
+    def handle_pr_request(self, user_input: str, repo_url: str, pr_options: Dict[str, Any] = None) -> Dict[str, Any]:
+        """Handle requests specifically for creating Pull Requests"""
+        try:
+            self.log_message(f"Processing PR request for repo: {repo_url}")
+            
+            # Step 1: Initialize PR workflow
+            pr_result = self.pr_manager.process_task({
+                'action': 'process_pr_request',
+                'user_request': user_input,
+                'repo_url': repo_url,
+                'options': pr_options or {}
+            })
+            
+            if pr_result.get('status') != 'ready_for_changes':
+                return pr_result
+            
+            # Step 2: Get repository context and analysis
+            repo_context = pr_result.get('repo_analysis', {})
+            
+            # Step 3: Get recommendations from Prompt Ask Engineer
+            analysis_result = self.prompt_ask_engineer.process_task({
+                'request': user_input,
+                'repo_context': repo_context.get('summary', ''),
+                'action': 'analyze_and_recommend'
+            })
+            
+            # Step 4: Generate code tasks
+            code_tasks = self.prompt_code_engineer.process_task({
+                'user_request': user_input,
+                'analysis': analysis_result.get('analysis', ''),
+                'recommendations': analysis_result.get('recommendations', []),
+                'repo_context': repo_context.get('summary', '')
+            })
+            
+            # Step 5: Execute code changes
+            code_result = self.code_agent.process_task({
+                'tasks': code_tasks.get('code_tasks', []),
+                'files_to_change': code_tasks.get('files_to_change', []),
+                'context': repo_context.get('summary', '')
+            })
+            
+            # Step 6: Execute PR workflow with the generated changes
+            final_result = self.pr_manager.execute_pr_workflow(
+                workflow_id=pr_result['workflow_id'],
+                changes=code_result
+            )
+            
+            return {
+                'status': final_result.get('status', 'completed'),
+                'workflow_id': pr_result['workflow_id'],
+                'pr_result': final_result,
+                'analysis': analysis_result,
+                'code_tasks': code_tasks,
+                'code_result': code_result,
+                'message': 'PR workflow completed successfully'
+            }
+            
+        except Exception as e:
+            error_msg = f"Error in PR request handling: {str(e)}"
+            self.log_message(error_msg, "ERROR")
+            return {
+                'status': 'error',
+                'error': error_msg,
+                'message': 'PR request processing failed'
+            }

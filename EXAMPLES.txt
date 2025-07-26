@@ -1,0 +1,101 @@
+================================================================================
+                           ПРИКЛАДИ КОМАНД
+================================================================================
+
+🔧 ЗАПУСК СЕРВЕРА:
+
+Windows:
+    start_server.bat
+
+Command Line:
+    python main.py
+    python run.py
+
+================================================================================
+
+🧪 ТЕСТУВАННЯ:
+
+Базовий тест:
+    python simple_test.py
+
+Тест калькулятора:
+    python final_calculator_test.py
+
+Перевірка статусу:
+    curl http://localhost:5000/api/status
+
+================================================================================
+
+🚀 СТВОРЕННЯ PR:
+
+Простий файл:
+curl -X POST http://localhost:5000/api/pr/create -H "Content-Type: application/json" -d "{\"user_request\": \"Add hello.py with print('Hello World')\", \"repo_url\": \"https://github.com/Farckron/SimpleCalc.git\"}"
+
+Калькулятор:
+curl -X POST http://localhost:5000/api/pr/create -H "Content-Type: application/json" -d "{\"user_request\": \"Create Python calculator with +, -, *, / operations\", \"repo_url\": \"https://github.com/Farckron/SimpleCalc.git\"}"
+
+README файл:
+curl -X POST http://localhost:5000/api/pr/create -H "Content-Type: application/json" -d "{\"user_request\": \"Add README.md with project description\", \"repo_url\": \"https://github.com/Farckron/SimpleCalc.git\"}"
+
+================================================================================
+
+📊 АНАЛІЗ РЕПОЗИТОРІЮ:
+
+curl "http://localhost:5000/api/repository/analyze?repo_url=https://github.com/Farckron/SimpleCalc"
+
+================================================================================
+
+🔍 ОБРОБКА БЕЗ PR:
+
+curl -X POST http://localhost:5000/api/process_request -H "Content-Type: application/json" -d "{\"request\": \"Analyze this repository and give recommendations\", \"repo_url\": \"https://github.com/Farckron/SimpleCalc\", \"create_pr\": false}"
+
+================================================================================
+
+💡 СКЛАДНІ ПРИКЛАДИ:
+
+Flask API:
+{
+  "user_request": "Create Flask API with endpoints: GET /users, POST /users, GET /users/:id, PUT /users/:id, DELETE /users/:id",
+  "repo_url": "https://github.com/Farckron/SimpleCalc.git"
+}
+
+Веб-сторінка:
+{
+  "user_request": "Create HTML page with CSS styling for a simple portfolio website",
+  "repo_url": "https://github.com/Farckron/SimpleCalc.git"
+}
+
+Тести:
+{
+  "user_request": "Add unit tests for existing Python functions using pytest",
+  "repo_url": "https://github.com/Farckron/SimpleCalc.git"
+}
+
+================================================================================
+
+🌐 ЧЕРЕЗ БРАУЗЕР:
+
+1. Відкрийте: http://localhost:5000
+2. Використайте Postman або подібний інструмент
+3. POST запит на: http://localhost:5000/api/pr/create
+4. Body (JSON):
+   {
+     "user_request": "ваш запит тут",
+     "repo_url": "https://github.com/ваш_username/ваш_репозиторій.git"
+   }
+
+================================================================================
+
+🔧 НАЛАГОДЖЕННЯ:
+
+Перевірити логи:
+    Дивіться консоль де запущений сервер
+
+Очистити кеш:
+    python cleanup.py
+
+Перезапустити:
+    Ctrl+C (зупинити)
+    python main.py (запустити знову)
+
+================================================================================
