@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Agents Project - Code Development Assistant</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="container">
+        <header class="header">
+            <h1><i class="fas fa-robot"></i> AI Agents Project</h1>
+            <p class="subtitle">Multi-Agent Code Development Assistant</p>
+            <div class="status-indicator">
+                <span id="system-status" class="status-dot offline"></span>
+                <span>System Status</span>
+            </div>
+        </header>
+
+        <main class="main-content">
+            <!-- Agent Workflow Visualization -->
+            <section class="workflow-section">
+                <h2><i class="fas fa-sitemap"></i> Agent Workflow</h2>
+                <div class="workflow-diagram">
+                    <div class="agent-node" data-agent="github">
+                        <i class="fab fa-github"></i>
+                        <h3>GitHub Pull</h3>
+                        <p>Repository sync</p>
+                    </div>
+                    
+                    <div class="workflow-arrow">→</div>
+                    
+                    <div class="agent-node" data-agent="update">
+                        <i class="fas fa-sync"></i>
+                        <h3>Update Source</h3>
+                        <p>Project sync</p>
+                    </div>
+                    
+                    <div class="workflow-arrow">→</div>
+                    
+                    <div class="agent-node active" data-agent="project-manager">
+                        <i class="fas fa-user-tie"></i>
+                        <h3>Project Manager</h3>
+                        <p>Task coordination</p>
+                    </div>
+                    
+                    <div class="workflow-arrow">→</div>
+                    
+                    <div class="agent-node" data-agent="prompt-ask">
+                        <i class="fas fa-search"></i>
+                        <h3>Prompt Ask Engineer</h3>
+                        <p>Analysis & recommendations</p>
+                    </div>
+                    
+                    <div class="workflow-arrow">→</div>
+                    
+                    <div class="agent-node" data-agent="prompt-code">
+                        <i class="fas fa-code"></i>
+                        <h3>Prompt Code Engineer</h3>
+                        <p>Task specification</p>
+                    </div>
+                    
+                    <div class="workflow-arrow">→</div>
+                    
+                    <div class="agent-node" data-agent="code-agent">
+                        <i class="fas fa-cog"></i>
+                        <h3>Code Agent</h3>
+                        <p>Code implementation</p>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Request Input Section -->
+            <section class="request-section">
+                <h2><i class="fas fa-keyboard"></i> Submit Development Request</h2>
+                <div class="request-form">
+                    <div class="form-group">
+                        <label for="user-request">Describe what you want to implement:</label>
+                        <textarea 
+                            id="user-request" 
+                            placeholder="e.g., Add user authentication, Fix the memory leak in the game loop, Implement a new feature for..."
+                            rows="4"></textarea>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="repo-url">Repository URL (optional):</label>
+                        <input 
+                            type="url" 
+                            id="repo-url" 
+                            placeholder="https://github.com/username/repository"
+                            value="https://github.com/Farckron/RetroConsole">
+                    </div>
+                    
+                    <button id="submit-request" class="btn btn-primary">
+                        <i class="fas fa-paper-plane"></i> Process Request
+                    </button>
+                </div>
+            </section>
+
+            <!-- Progress Section -->
+            <section class="progress-section" id="progress-section" style="display: none;">
+                <h2><i class="fas fa-tasks"></i> Processing Progress</h2>
+                <div class="progress-container">
+                    <div class="progress-bar">
+                        <div class="progress-fill" id="progress-fill"></div>
+                    </div>
+                    <div class="progress-steps">
+                        <div class="step" data-step="1">
+                            <i class="fas fa-download"></i>
+                            <span>Repository Analysis</span>
+                        </div>
+                        <div class="step" data-step="2">
+                            <i class="fas fa-search"></i>
+                            <span>Request Analysis</span>
+                        </div>
+                        <div class="step" data-step="3">
+                            <i class="fas fa-code"></i>
+                            <span>Code Planning</span>
+                        </div>
+                        <div class="step" data-step="4">
+                            <i class="fas fa-cog"></i>
+                            <span>Implementation</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="current-status" id="current-status">
+                    <i class="fas fa-spinner fa-spin"></i>
+                    <span>Initializing...</span>
+                </div>
+            </section>
+
+            <!-- Results Section -->
+            <section class="results-section" id="results-section" style="display: none;">
+                <h2><i class="fas fa-check-circle"></i> Results</h2>
+                <div class="results-container" id="results-container">
+                    <!-- Results will be populated here -->
+                </div>
+            </section>
+
+            <!-- Agent Status Cards -->
+            <section class="agents-section">
+                <h2><i class="fas fa-users"></i> Agent Status</h2>
+                <div class="agents-grid">
+                    <div class="agent-card" data-agent="project_manager">
+                        <div class="agent-header">
+                            <i class="fas fa-user-tie"></i>
+                            <h3>Project Manager</h3>
+                            <span class="agent-status loading">Loading...</span>
+                        </div>
+                        <div class="agent-stats">
+                            <div class="stat">
+                                <span class="stat-label">Messages:</span>
+                                <span class="stat-value" data-stat="message_count">-</span>
+                            </div>
+                            <div class="stat">
+                                <span class="stat-label">Temperature:</span>
+                                <span class="stat-value" data-stat="temperature">-</span>
+                            </div>
+                        </div>
+                        <button class="btn btn-small btn-secondary reset-agent">Reset</button>
+                    </div>
+
+                    <div class="agent-card" data-agent="prompt_ask_engineer">
+                        <div class="agent-header">
+                            <i class="fas fa-search"></i>
+                            <h3>Prompt Ask Engineer</h3>
+                            <span class="agent-status loading">Loading...</span>
+                        </div>
+                        <div class="agent-stats">
+                            <div class="stat">
+                                <span class="stat-label">Messages:</span>
+                                <span class="stat-value" data-stat="message_count">-</span>
+                            </div>
+                            <div class="stat">
+                                <span class="stat-label">Temperature:</span>
+                                <span class="stat-value" data-stat="temperature">-</span>
+                            </div>
+                        </div>
+                        <button class="btn btn-small btn-secondary reset-agent">Reset</button>
+                    </div>
+
+                    <div class="agent-card" data-agent="prompt_code_engineer">
+                        <div class="agent-header">
+                            <i class="fas fa-code"></i>
+                            <h3>Prompt Code Engineer</h3>
+                            <span class="agent-status loading">Loading...</span>
+                        </div>
+                        <div class="agent-stats">
+                            <div class="stat">
+                                <span class="stat-label">Messages:</span>
+                                <span class="stat-value" data-stat="message_count">-</span>
+                            </div>
+                            <div class="stat">
+                                <span class="stat-label">Temperature:</span>
+                                <span class="stat-value" data-stat="temperature">-</span>
+                            </div>
+                        </div>
+                        <button class="btn btn-small btn-secondary reset-agent">Reset</button>
+                    </div>
+
+                    <div class="agent-card" data-agent="code_agent">
+                        <div class="agent-header">
+                            <i class="fas fa-cog"></i>
+                            <h3>Code Agent</h3>
+                            <span class="agent-status loading">Loading...</span>
+                        </div>
+                        <div class="agent-stats">
+                            <div class="stat">
+                                <span class="stat-label">Messages:</span>
+                                <span class="stat-value" data-stat="message_count">-</span>
+                            </div>
+                            <div class="stat">
+                                <span class="stat-label">Temperature:</span>
+                                <span class="stat-value" data-stat="temperature">-</span>
+                            </div>
+                        </div>
+                        <button class="btn btn-small btn-secondary reset-agent">Reset</button>
+                    </div>
+
+                    <div class="agent-card" data-agent="github_manager">
+                        <div class="agent-header">
+                            <i class="fab fa-github"></i>
+                            <h3>GitHub Manager</h3>
+                            <span class="agent-status loading">Loading...</span>
+                        </div>
+                        <div class="agent-stats">
+                            <div class="stat">
+                                <span class="stat-label">Messages:</span>
+                                <span class="stat-value" data-stat="message_count">-</span>
+                            </div>
+                            <div class="stat">
+                                <span class="stat-label">Temperature:</span>
+                                <span class="stat-value" data-stat="temperature">-</span>
+                            </div>
+                        </div>
+                        <button class="btn btn-small btn-secondary reset-agent">Reset</button>
+                    </div>
+                </div>
+            </section>
+        </main>
+
+        <footer class="footer">
+            <div class="footer-content">
+                <div class="footer-section">
+                    <h4>Quick Actions</h4>
+                    <a href="/dashboard">Agent Dashboard</a>
+                    <a href="#" id="view-logs">View Logs</a>
+                    <a href="#" id="clear-session">Clear Session</a>
+                </div>
+                <div class="footer-section">
+                    <h4>Configuration</h4>
+                    <p>Max Messages: <span id="max-messages">5</span></p>
+                    <p>OpenAI: <span id="openai-status" class="status-text">Unknown</span></p>
+                    <p>GitHub: <span id="github-status" class="status-text">Unknown</span></p>
+                </div>
+                <div class="footer-section">
+                    <h4>About</h4>
+                    <p>AI Agents Project - Multi-agent system for automated code development based on Obsidian Canvas workflow.</p>
+                </div>
+            </div>
+        </footer>
+    </div>
+
+    <!-- Loading Modal -->
+    <div id="loading-modal" class="modal" style="display: none;">
+        <div class="modal-content">
+            <div class="loading-spinner">
+                <i class="fas fa-spinner fa-spin"></i>
+            </div>
+            <p>Processing request...</p>
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='js/main.js') }}"></script>
+</body>
+</html>
