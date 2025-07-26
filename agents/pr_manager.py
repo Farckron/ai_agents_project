@@ -1,574 +1,460 @@
-from typing import Dict, Any, List, Optional
+# agents/pr_manager.py
+from typing import Dict, Any, List, Optional, Tuple, Callable
+import os
 import uuid
+import re
+import base64
+import json
 from datetime import datetime
+
+# HTTP: prefer requests, fallback to urllib
+try:
+    import requests  # type: ignore
+except Exception:  # pragma: no cover
+    requests = None
+    import urllib.request
+    import urllib.error
+
 from .base_agent import BaseAgent
 from .github_manager import GitHubManager
-from utils.structured_logger import get_structured_logger, log_pr_start, log_pr_step, log_pr_complete, LogLevel
-from utils.git_operations import GitOperations
-from utils.error_handler import ErrorHandler, ErrorType, ErrorSeverity
+from .prompt_ask_engineer import PromptAskEngineer
+from .prompt_code_engineer import PromptCodeEngineer
+from .code_agent import CodeAgent
+
+from utils.structured_logger import (
+    get_structured_logger, log_pr_start, log_pr_step, log_pr_complete,
+    LogLevel, LogCategory
+)
+from utils.error_handler import ErrorHandler
+
+GITHUB_API = "https://api.github.com"
+
+
+def _http_json(method: str, url: str, headers: Dict[str, str], payload: Optional[Dict[str, Any]] = None):
+    """Send JSON over HTTP. Returns (status_code, json_dict)."""
+    if requests is not None:
+        resp = requests.request(method, url, headers=headers, json=payload)
+        try:
+            return resp.status_code, (resp.json() if resp.text else {})
+        except Exception:
+            return resp.status_code, {}
+    else:
+        data = json.dumps(payload).encode("utf-8") if payload is not None else None
+        req = urllib.request.Request(url, method=method, headers=headers)  # type: ignore
+        if data is not None:
+            req.data = data  # type: ignore[attr-defined]
+            req.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(req) as r:  # type: ignore
+                body = r.read().decode("utf-8")
+                return r.getcode(), (json.loads(body) if body else {})
+        except urllib.error.HTTPError as e:  # type: ignore
+            body = e.read().decode("utf-8")
+            try:
+                return e.code, json.loads(body)
+            except Exception:
+                return e.code, {"message": body or str(e)}
+        except Exception as e:
+            return 0, {"message": str(e)}
+
 
 class PRManager(BaseAgent):
+    """
+    Canvas flow (screenshot):
+      Text → Prompt Ask → (decision) → Prompt Code → Code Agent → PR.
+    Only real code files are committed to GitHub. No placeholders.
+    """
     def __init__(self):
         super().__init__("pr_manager")
-        
-        # Initialize GitHub manager for repository operations
-        self.github_manager = GitHubManager()
-        
-        # Initialize Git operations utility
-        self.git_operations = GitOperations()
-        
-        # Initialize error handler
-        self.error_handler = ErrorHandler("pr_manager")
-        
-        # Initialize structured logger
-        self.structured_logger = get_structured_logger("pr_manager")
-        
-        # Track PR workflows
-        self.active_workflows: Dict[str, Dict[str, Any]] = {}
-        self.completed_workflows: List[Dict[str, Any]] = []
-        
-        self.log_message("PR Manager initialized")
+
+        self.ask_engineer   = PromptAskEngineer()
+        self.code_planner   = PromptCodeEngineer()
+        self.code_agent     = CodeAgent()
+
+        self.github_manager: GitHubManager = GitHubManager()
+        self.error_handler                 = ErrorHandler("PRManager")
+        self.structured_logger             = get_structured_logger("pr_manager")
+
+        # ASCII only to avoid Windows console encoding problems
+        self.log_message("PR Manager initialized (code-only workflow)")
         try:
             self.structured_logger.log_structured(
                 LogLevel.INFO,
-                "SYSTEM",
-                "PR Manager initialized with GitOperations and ErrorHandler",
-                component="pr_manager"
+                LogCategory.SYSTEM,
+                "PR Manager initialized: code-only, commits only CodeAgent outputs",
+                component="pr_manager",
             )
         except Exception as e:
             self.log_message(f"Structured logging failed: {str(e)}", "WARNING")
-    
-    def process_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Main task processing method for PR operations
-        
-        Expected task structure:
-        {
-            'action': 'create_pr' | 'process_pr_request' | 'get_workflow_status',
-            'user_request': str,
-            'repo_url': str,
-            'options': {
-                'branch_name': str (optional),
-                'pr_title': str (optional), 
-                'pr_description': str (optional),
-                'base_branch': str (default: main),
-                'auto_merge': bool (default: false)
-            }
-        }
-        """
-        try:
-            action = task.get('action', 'process_pr_request')
-            
-            self.log_message(f"Processing PR action: {action}")
-            
-            if action == 'process_pr_request':
-                return self.process_pr_request(
-                    user_request=task.get('user_request', ''),
-                    repo_url=task.get('repo_url', ''),
-                    options=task.get('options', {})
-                )
-            elif action == 'get_workflow_status':
-                return self.get_workflow_status(task.get('workflow_id', ''))
-            elif action == 'create_pr':
-                return self.create_pull_request(
-                    repo_url=task.get('repo_url', ''),
-                    branch_name=task.get('branch_name', ''),
-                    title=task.get('title', ''),
-                    description=task.get('description', ''),
-                    base_branch=task.get('base_branch', 'main')
-                )
-            else:
-                return {
-                    'status': 'error',
-                    'message': f'Unknown PR action: {action}'
-                }
-                
-        except Exception as e:
-            error_msg = f"Error in PR Manager: {str(e)}"
-            self.log_message(error_msg, "ERROR")
+
+    # ──────────────────────────────────────────────────────────
+    # Public entry
+    # ──────────────────────────────────────────────────────────
+    def process_pr_request(self, user_request: str, repo_url: str, options: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        options = options or {}
+        ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+        log_pr_start(self.structured_logger, "pr_manager", {
+            "repo_url": repo_url,
+            "user_request": user_request,
+            "options": options,
+        })
+
+        # 0) minimal repo context (default_branch + README text)
+        repo_ctx = self._fetch_repo_context(repo_url)
+        repo_ctx_text = repo_ctx.get("readme", "")
+
+        # 1) Ask Engineer: summary + decision (if method absent, assume changes needed)
+        summary, requires_changes = self._ask_engineer_decision(user_request, repo_ctx_text)
+        if not requires_changes:
+            msg = "No important changes required according to Prompt Ask Engineer."
+            self.log_message(msg, "INFO")
             return {
-                'status': 'error',
-                'error': error_msg
+                "ok": True,
+                "message": msg,
+                "generated_files": [],
+                "pr_result": {"created": False, "pr_url": None, "branch": None, "base": repo_ctx.get("default_branch"), "error": None},
+                "meta": {"timestamp": ts, "repo_url": repo_url, "summary": summary},
             }
-    
-    def process_pr_request(self, user_request: str, repo_url: str, options: Dict[str, Any] = None) -> Dict[str, Any]:
-        """
-        Process a user request to create a PR with code changes
-        
-        This is the main workflow method that coordinates the entire PR creation process
-        """
-        if options is None:
-            options = {}
-            
-        # Generate unique workflow ID
-        workflow_id = str(uuid.uuid4())
-        
-        # Initialize workflow tracking
-        workflow = {
-            'workflow_id': workflow_id,
-            'user_request': user_request,
-            'repo_url': repo_url,
-            'options': options,
-            'status': 'processing',
-            'steps': [],
-            'created_at': datetime.now().isoformat(),
-            'updated_at': datetime.now().isoformat()
-        }
-        
-        self.active_workflows[workflow_id] = workflow
-        
-        # Log PR workflow start
-        log_pr_start(
-            workflow_id=workflow_id,
-            repo_url=repo_url,
-            user_request=user_request,
-            options=options
-        )
-        
-        try:
-            # Step 1: Validate repository access
-            self.log_message(f"Starting PR workflow {workflow_id}")
-            
-            with self.structured_logger.performance_timer("validate_repository_access", workflow_id=workflow_id):
-                validation_result = self._validate_repository_access(repo_url)
-            
-            self._add_workflow_step(workflow_id, 'validate_repository', validation_result)
-            log_pr_step(
-                workflow_id=workflow_id,
-                step_name="validate_repository",
-                status=validation_result['status'],
-                result=validation_result
-            )
-            
-            if validation_result['status'] != 'success':
-                log_pr_complete(
-                    workflow_id=workflow_id,
-                    status='failed',
-                    error_message=validation_result['message']
-                )
-                return self._complete_workflow(workflow_id, 'failed', validation_result['message'])
-            
-            # Step 2: Generate branch name if not provided
-            branch_name = options.get('branch_name')
-            if not branch_name:
-                branch_name = self.generate_branch_name(user_request)
-                self._add_workflow_step(workflow_id, 'generate_branch_name', {
-                    'status': 'success',
-                    'branch_name': branch_name
-                })
-            
-            # Step 3: Analyze repository context
-            with self.structured_logger.performance_timer("analyze_repository", workflow_id=workflow_id):
-                repo_analysis = self.github_manager.process_task({
-                    'action': 'get_repo_summary',
-                    'repo_url': repo_url
-                })
-            
-            self._add_workflow_step(workflow_id, 'analyze_repository', repo_analysis)
-            log_pr_step(
-                workflow_id=workflow_id,
-                step_name="analyze_repository",
-                status=repo_analysis.get('status', 'unknown'),
-                result=repo_analysis
-            )
-            
-            # Step 4: Generate PR description
-            pr_title = options.get('pr_title', f"Automated changes: {user_request[:50]}...")
-            pr_description = options.get('pr_description')
-            if not pr_description:
-                pr_description = self.create_pr_description(user_request, repo_analysis.get('summary', ''))
-                self._add_workflow_step(workflow_id, 'generate_pr_description', {
-                    'status': 'success',
-                    'description': pr_description
-                })
-            
-            # Step 5: Prepare workflow for code generation (this will be handled by other agents)
-            workflow_result = {
-                'status': 'ready_for_changes',
-                'workflow_id': workflow_id,
-                'branch_name': branch_name,
-                'pr_title': pr_title,
-                'pr_description': pr_description,
-                'repo_analysis': repo_analysis,
-                'message': 'PR workflow prepared. Ready for code changes to be applied.',
-                'next_steps': [
-                    'Generate code changes using Code Agent',
-                    'Create branch and commit changes',
-                    'Create Pull Request'
-                ]
-            }
-            
-            self._add_workflow_step(workflow_id, 'prepare_workflow', {
-                'status': 'success',
-                'result': workflow_result
-            })
-            
-            return workflow_result
-            
-        except Exception as e:
-            error_msg = f"Error in PR workflow: {str(e)}"
-            self.log_message(error_msg, "ERROR")
-            return self._complete_workflow(workflow_id, 'failed', error_msg)
-    
-    def execute_pr_workflow(self, workflow_id: str, changes: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Execute the final steps of PR creation with the provided changes
-        
-        Args:
-            workflow_id: The workflow ID from process_pr_request
-            changes: Dictionary containing file changes to commit
-        """
-        if workflow_id not in self.active_workflows:
+
+        # 2) Code plan/spec
+        plan = self._plan_changes(user_request, repo_ctx_text, summary)
+
+        # 3) Code Agent → files
+        code_files = self._produce_code_files(user_request, repo_ctx_text, plan)
+
+        if not code_files:
+            msg = "Code Agent did not produce any files (no code blocks with paths found)."
+            self.log_message(msg, "WARNING")
             return {
-                'status': 'error',
-                'message': f'Workflow {workflow_id} not found'
+                "ok": False,
+                "message": msg,
+                "generated_files": [],
+                "pr_result": {"created": False, "pr_url": None, "branch": None, "base": repo_ctx.get("default_branch"), "error": msg},
+                "meta": {"timestamp": ts, "repo_url": repo_url, "summary": summary, "plan": plan},
             }
-        
-        workflow = self.active_workflows[workflow_id]
-        
+
+        # 4) Create PR via REST
+        pr_result: Dict[str, Any] = {
+            "created": False,
+            "pr_url": None,
+            "branch": None,
+            "base": options.get("base_branch", repo_ctx.get("default_branch") or "main"),
+            "error": None,
+        }
         try:
-            repo_url = workflow['repo_url']
-            branch_name = None
-            pr_title = None
-            pr_description = None
-            
-            # Extract workflow data from steps
-            for step in workflow['steps']:
-                if step['step_name'] == 'generate_branch_name':
-                    branch_name = step['result'].get('branch_name')
-                elif step['step_name'] == 'prepare_workflow':
-                    result = step['result'].get('result', {})
-                    branch_name = result.get('branch_name')
-                    pr_title = result.get('pr_title')
-                    pr_description = result.get('pr_description')
-            
-            if not branch_name:
-                return self._complete_workflow(workflow_id, 'failed', 'Branch name not found in workflow')
-            
-            # Step 1: Create branch
-            branch_result = self.github_manager.process_task({
-                'action': 'create_branch',
-                'repo_url': repo_url,
-                'branch_name': branch_name
-            })
-            self._add_workflow_step(workflow_id, 'create_branch', branch_result)
-            
-            if branch_result['status'] != 'success':
-                return self._complete_workflow(workflow_id, 'failed', f"Failed to create branch: {branch_result.get('error', 'Unknown error')}")
-            
-            # Step 2: Commit changes
-            commit_message = f"Automated changes: {workflow['user_request']}"
-            commit_result = self.github_manager.process_task({
-                'action': 'commit_changes',
-                'repo_url': repo_url,
-                'files': changes.get('files', {}),
-                'message': commit_message
-            })
-            self._add_workflow_step(workflow_id, 'commit_changes', commit_result)
-            
-            if commit_result['status'] != 'success':
-                return self._complete_workflow(workflow_id, 'failed', f"Failed to commit changes: {commit_result.get('error', 'Unknown error')}")
-            
-            # Step 3: Create Pull Request
-            pr_result = self.create_pull_request(
+            branch = self._safe_generate_branch_name(user_request)
+            pr_title = options.get("title") or f"Automated code update: {self._shorten(user_request, 60)}"
+            pr_body  = self._compose_pr_body(user_request, code_files, ts, summary, plan)
+
+            created, pr_url = self._create_pr_via_rest(
                 repo_url=repo_url,
-                branch_name=branch_name,
+                branch_name=branch,
+                base_branch=pr_result["base"],
                 title=pr_title,
-                description=pr_description,
-                base_branch=workflow['options'].get('base_branch', 'main')
+                body=pr_body,
+                files=code_files,
             )
-            self._add_workflow_step(workflow_id, 'create_pull_request', pr_result)
-            
-            if pr_result['status'] == 'success':
-                return self._complete_workflow(workflow_id, 'completed', 'PR created successfully', pr_result)
+            pr_result.update({"created": created, "pr_url": pr_url, "branch": branch})
+        except Exception as e:
+            pr_result["error"] = str(e)
+            self.log_message(f"PR creation failed: {e}", level="ERROR")
+
+        log_pr_complete(self.structured_logger, "pr_manager", {
+            "repo_url": repo_url,
+            "pr_created": pr_result["created"],
+            "pr_url": pr_result["pr_url"],
+            "branch": pr_result["branch"],
+            "base": pr_result["base"],
+            "files_len": len(code_files),
+        })
+
+        return {
+            "ok": True,
+            "message": "Workflow complete",
+            "generated_files": code_files,
+            "pr_result": pr_result,
+            "meta": {"timestamp": ts, "repo_url": repo_url, "summary": summary, "plan": plan},
+        }
+
+    # ──────────────────────────────────────────────────────────
+    # Canvas steps
+    # ──────────────────────────────────────────────────────────
+    def _ask_engineer_decision(self, user_request: str, repo_ctx_text: str) -> Tuple[str, bool]:
+        """Return (summary, requires_changes). Prefer process_task API."""
+        # Preferred path
+        if hasattr(self.ask_engineer, "process_task"):
+            try:
+                out = self.ask_engineer.process_task({"request": user_request, "repo_context": repo_ctx_text})
+                if isinstance(out, dict):
+                    summary = str(out.get("analysis") or out.get("summary") or "")
+                    rc = out.get("requires_changes")
+                    if isinstance(rc, bool):
+                        return summary, rc
+                    # If not provided, infer
+                    return summary, self._infer_requires_changes(summary or user_request)
+            except Exception as e:
+                self.log_message(f"PromptAskEngineer.process_task failed: {e}", "WARNING")
+
+        # Fallbacks (best-effort)
+        for name in ("summarize_repo", "analyze_repo", "analyze", "summarize"):
+            if hasattr(self.ask_engineer, name):
+                try:
+                    fn = getattr(self.ask_engineer, name)
+                    summary = str(fn(repo_ctx_text, user_request)) if name in ("summarize_repo", "analyze_repo") else str(fn(user_request))
+                    return summary, self._infer_requires_changes(summary or user_request)
+                except Exception as e:
+                    self.log_message(f"PromptAskEngineer.{name} failed: {e}", "WARNING")
+        # No agent → assume changes needed if prompt looks actionable
+        return user_request.strip(), self._infer_requires_changes(user_request)
+
+    def _infer_requires_changes(self, text: str) -> bool:
+        if not text: 
+            return False
+        t = text.lower()
+        keywords = ["add","fix","implement","update","create","refactor","додай","виправ","онов","створ","рефактор"]
+        return any(k in t for k in keywords) or len(t) > 15
+
+    def _plan_changes(self, user_request: str, repo_ctx_text: str, summary: str) -> Any:
+        if hasattr(self.code_planner, "process_task"):
+            try:
+                out = self.code_planner.process_task({
+                    "user_request": user_request,
+                    "analysis": summary,
+                    "recommendations": "",  # allow empty
+                    "repo_context": repo_ctx_text,
+                })
+                return out if isinstance(out, dict) else {"raw": str(out)}
+            except Exception as e:
+                self.log_message(f"PromptCodeEngineer.process_task failed: {e}", "WARNING")
+        # Fallback: return minimal dict
+        return {"targets": [], "notes": "no planner"}
+
+    def _produce_code_files(self, user_request: str, repo_ctx_text: str, plan: Any) -> List[Dict[str, str]]:
+        """Call CodeAgent.process_task and extract files from text responses only.
+        No placeholders are created if nothing is extracted.
+        """
+        # Build a single consolidated task for the CodeAgent
+        tasks = []
+        code_tasks = []
+        if isinstance(plan, dict):
+            code_tasks = plan.get("code_tasks") or plan.get("tasks") or []
+        if not isinstance(code_tasks, list):
+            code_tasks = []
+        # Ensure every task has a task_id
+        for i, t in enumerate(code_tasks, start=1):
+            if isinstance(t, dict) and "task_id" not in t:
+                t["task_id"] = f"task-{i:03d}"
+        tasks = code_tasks
+
+        if hasattr(self.code_agent, "process_task"):
+            try:
+                out = self.code_agent.process_task({
+                    "tasks": tasks,
+                    "files_to_change": (plan.get("files_to_change") if isinstance(plan, dict) else []) or [],
+                    "context": repo_ctx_text,
+                })
+                # Expect list of per-task results in 'task_results', each with text
+                texts: List[str] = []
+                if isinstance(out, dict):
+                    if isinstance(out.get("task_results"), list):
+                        for r in out.get("task_results") or []:
+                            # pick common keys that likely contain code
+                            for k in ("generated_code","modifications","fixed_code","review_results","code"):
+                                v = r.get(k)
+                                if isinstance(v, str) and v.strip():
+                                    texts.append(v)
+                    # Some implementations also return 'summary' text
+                    if isinstance(out.get("summary"), str):
+                        texts.append(out["summary"])
+                # Extract files from collected text
+                files: List[Dict[str,str]] = []
+                for txt in texts:
+                    files.extend(self._extract_files_from_text(txt))
+                # Deduplicate by path, keep last
+                uniq: Dict[str,str] = {}
+                for f in files:
+                    if f.get("path") and f.get("content") is not None:
+                        uniq[f["path"]] = f["content"]
+                return [{"path": p, "content": c} for p,c in uniq.items()]
+            except Exception as e:
+                self.log_message(f"CodeAgent.process_task failed: {e}", "WARNING")
+        return []
+
+    # ──────────────────────────────────────────────────────────
+    # GitHub REST
+    # ──────────────────────────────────────────────────────────
+    def _create_pr_via_rest(self, repo_url: str, branch_name: str, base_branch: str, title: str, body: str, files: List[Dict[str, str]]):
+        token = os.getenv("GITHUB_TOKEN", "").strip()
+        if not token:
+            raise RuntimeError("GITHUB_TOKEN is not set")
+        owner, repo = self._parse_repo_url(repo_url)
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "ai-agents-pr-manager",
+        }
+        base = self._resolve_base_branch(owner, repo, base_branch, headers)
+        self._log_step("Creating branch (REST)", {"branch": branch_name, "base": base})
+        self._ensure_branch(owner, repo, branch_name, base, headers)
+        self._log_step("Committing files (REST)", {"files": [f["path"] for f in files]})
+        for f in files:
+            self._put_file(owner, repo, f["path"], f["content"], title, branch_name, headers)
+        self._log_step("Opening PR (REST)", {"title": title})
+        pr_url = self._open_pr(owner, repo, head=branch_name, base=base, title=title, body=body, headers=headers)
+        return True, pr_url
+
+    def _resolve_base_branch(self, owner: str, repo: str, requested_base: str, headers: Dict[str, str]) -> str:
+        st, _ = _http_json("GET", f"{GITHUB_API}/repos/{owner}/{repo}/branches/{requested_base}", headers)
+        if st == 200:
+            return requested_base
+        st, repo_meta = _http_json("GET", f"{GITHUB_API}/repos/{owner}/{repo}", headers)
+        if st != 200:
+            raise RuntimeError(f"Failed to read repo meta: HTTP {st}")
+        default_branch = repo_meta.get("default_branch") or "main"
+        st, _ = _http_json("GET", f"{GITHUB_API}/repos/{owner}/{repo}/branches/{default_branch}", headers)
+        if st != 200:
+            raise RuntimeError(f"Base branch not found: '{requested_base}', and default '{default_branch}' missing")
+        return default_branch
+
+    def _ensure_branch(self, owner: str, repo: str, branch: str, base: str, headers: Dict[str, str]) -> None:
+        st, base_data = _http_json("GET", f"{GITHUB_API}/repos/{owner}/{repo}/branches/{base}", headers)
+        if st != 200:
+            raise RuntimeError(f"Cannot read base branch '{base}': HTTP {st}")
+        base_sha = (base_data.get("commit") or {}).get("sha")
+        if not base_sha:
+            raise RuntimeError("Base branch SHA not found")
+        payload = {"ref": f"refs/heads/{branch}", "sha": base_sha}
+        st, resp = _http_json("POST", f"{GITHUB_API}/repos/{owner}/{repo}/git/refs", headers, payload)
+        if st in (200, 201):
+            return
+        if st == 422 and "Reference already exists" in (resp.get("message") or ""):
+            return
+        raise RuntimeError(f"Failed to create branch '{branch}' from '{base}': HTTP {st} {resp.get('message')}")
+
+    def _put_file(self, owner: str, repo: str, path: str, content: str, message: str, branch: str, headers: Dict[str, str]) -> None:
+        enc = base64.b64encode(content.encode("utf-8")).decode("utf-8")
+        payload = {"message": message, "content": enc, "branch": branch}
+        st, resp = _http_json("PUT", f"{GITHUB_API}/repos/{owner}/{repo}/contents/{path}", headers, payload)
+        if st not in (200, 201):
+            raise RuntimeError(f"Failed to commit {path}: HTTP {st} {resp.get('message')}")
+
+    def _open_pr(self, owner: str, repo: str, head: str, base: str, title: str, body: str, headers: Dict[str, str]) -> Optional[str]:
+        payload = {"title": title, "head": head, "base": base, "body": body}
+        st, resp = _http_json("POST", f"{GITHUB_API}/repos/{owner}/{repo}/pulls", headers, payload)
+        if st in (201, 200):
+            return resp.get("html_url")
+        if st == 422:
+            q = f"is:pr is:open repo:{owner}/{repo} head:{head} base:{base}"
+            st2, sresp = _http_json("GET", f"{GITHUB_API}/search/issues?q={q}", headers)
+            if st2 == 200:
+                items = sresp.get("items") or []
+                if items:
+                    return items[0].get("html_url")
+        raise RuntimeError(f"Failed to open PR: HTTP {st} {resp.get('message')}")
+
+    # ──────────────────────────────────────────────────────────
+    # Repo context
+    # ──────────────────────────────────────────────────────────
+    def _fetch_repo_context(self, repo_url: str) -> Dict[str, Any]:
+        token = os.getenv("GITHUB_TOKEN", "").strip()
+        owner, repo = self._parse_repo_url(repo_url)
+        headers = {
+            "Authorization": f"Bearer {token}" if token else "",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "ai-agents-pr-manager",
+        }
+        ctx: Dict[str, Any] = {"owner": owner, "repo": repo, "default_branch": "main", "readme": ""}
+
+        st, meta = _http_json("GET", f"{GITHUB_API}/repos/{owner}/{repo}", headers)
+        if st == 200:
+            ctx["default_branch"] = meta.get("default_branch") or "main"
+
+        st, readme = _http_json("GET", f"{GITHUB_API}/repos/{owner}/{repo}/readme", headers)
+        if st == 200 and readme.get("content"):
+            try:
+                ctx["readme"] = base64.b64decode(readme["content"]).decode("utf-8", errors="ignore")
+            except Exception:
+                ctx["readme"] = ""
+        return ctx
+
+    # ──────────────────────────────────────────────────────────
+    # Helpers
+    # ──────────────────────────────────────────────────────────
+    def _compose_pr_body(self, user_request: str, files: List[Dict[str, str]], ts: str, summary: Any, plan: Any) -> str:
+        lines = [
+            f"Automated code update on {ts}",
+            "",
+            f"**Request**: {user_request}",
+            "",
+        ]
+        if summary:
+            lines += ["### Summary (Prompt Ask Engineer)", "", str(summary), ""]
+        if plan:
+            try:
+                plan_str = json.dumps(plan, ensure_ascii=False, indent=2)
+            except Exception:
+                plan_str = str(plan)
+            lines += ["### Plan (Prompt Code Engineer)", "", f"```json\n{plan_str}\n```", ""]
+        lines += ["### Files", *[f"- `{f['path']}`" for f in files], "", "> Generated by AI Agents workflow."]
+        return "\n".join(lines)
+
+    def _safe_generate_branch_name(self, user_request: str, prefix: str = "auto") -> str:
+        base = re.sub(r"[^a-zA-Z0-9\-]+", "-", user_request.strip().lower())[:30].strip("-") or "change"
+        return f"{prefix}/{base}-{uuid.uuid4().hex[:6]}"
+
+    def _parse_repo_url(self, repo_url: str) -> Tuple[str, str]:
+        m = re.search(r"github\.com[:/](?P<owner>[^/]+)/(?P<repo>[^/.]+)", repo_url)
+        if not m:
+            raise ValueError(f"Unsupported repo URL: {repo_url}")
+        return m.group("owner"), m.group("repo")
+
+    def _shorten(self, text: str, n: int) -> str:
+        return text if len(text) <= n else text[: n - 1] + "…"
+
+    def _log_step(self, msg: str, data: Optional[Dict[str, Any]] = None) -> None:
+        try:
+            log_pr_step(self.structured_logger, "pr_manager", msg, data or {})
+        except Exception:
+            pass
+
+    # ──────────────────────────────────────────────────────────
+    # File extraction
+    # ──────────────────────────────────────────────────────────
+    def _extract_files_from_text(self, text: str) -> List[Dict[str, str]]:
+        """Extract files from fenced blocks. Supported formats:
+            ```file=path/to/file.py
+            <full content>
+            ```
+            or first line inside block contains '# path: path/to/file.py' (or // path: ...).
+        """
+        files: List[Dict[str, str]] = []
+        if not text:
+            return files
+        # ```lang [anything possibly including file=path]
+        fence_re = re.compile(r"```(?P<info>[^\n]*)\n(?P<code>.*?)(?:```|$)", re.DOTALL)
+        for m in fence_re.finditer(text):
+            info = m.group("info") or ""
+            code = m.group("code") or ""
+            path = None
+            # Try to read file=path from info string
+            m1 = re.search(r"file\s*=\s*([^\s]+)", info)
+            if m1:
+                path = m1.group(1).strip()
             else:
-                return self._complete_workflow(workflow_id, 'failed', f"Failed to create PR: {pr_result.get('error', 'Unknown error')}")
-                
-        except Exception as e:
-            error_msg = f"Error executing PR workflow: {str(e)}"
-            self.log_message(error_msg, "ERROR")
-            return self._complete_workflow(workflow_id, 'failed', error_msg)
-    
-    def generate_branch_name(self, request_summary: str) -> str:
-        """Generate a unique branch name based on the request summary"""
-        try:
-            # Sanitize the request summary using GitOperations
-            sanitized_summary = self.git_operations.sanitize_user_input(request_summary, "branch_name")
-            
-            # Generate unique branch name using GitOperations
-            base_name = f"automated-{sanitized_summary}"
-            branch_name = self.git_operations.generate_unique_branch_name(base_name, "")
-            
-            # Validate the generated branch name
-            is_valid, error_msg = self.git_operations.validate_branch_name(branch_name)
-            if not is_valid:
-                self.log_message(f"Generated branch name invalid: {error_msg}", "WARNING")
-                # Use fallback
-                timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-                branch_name = f"automated-changes-{timestamp}"
-            
-            self.log_message(f"Generated branch name: {branch_name}")
-            return branch_name
-            
-        except Exception as e:
-            error_id = self.error_handler.log_error(
-                e, ErrorType.GENERAL, ErrorSeverity.MEDIUM,
-                {'operation': 'generate_branch_name', 'request_summary': request_summary[:100]}
-            )
-            # Fallback to timestamp-based name
-            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-            fallback_name = f"automated-changes-{timestamp}"
-            self.log_message(f"Using fallback branch name: {fallback_name} (Error ID: {error_id})", "WARNING")
-            return fallback_name
-    
-    def create_pr_description(self, user_request: str, repo_context: str = "") -> str:
-        """Generate a detailed PR description based on the user request and repository context"""
-        try:
-            description_prompt = f"""
-            Create a professional Pull Request description for the following automated changes:
-
-            USER REQUEST: {user_request}
-
-            REPOSITORY CONTEXT: {repo_context[:500]}...
-
-            The description should include:
-            1. A clear summary of what changes were made
-            2. Why these changes were necessary
-            3. Any relevant technical details
-            4. Testing considerations if applicable
-
-            Keep it professional and concise (max 300 words).
-            Format it in markdown.
-            """
-            
-            description = self.call_openai(description_prompt)
-            
-            # Add automated footer
-            footer = "\n\n---\n*This PR was created automatically by the AI Agent System*"
-            
-            return description + footer
-            
-        except Exception as e:
-            self.log_message(f"Error generating PR description: {str(e)}", "ERROR")
-            return f"""# Automated Changes
-
-## Summary
-{user_request}
-
-## Details
-This PR contains automated changes generated by the AI Agent System.
-
----
-*This PR was created automatically by the AI Agent System*
-"""
-    
-    def create_pull_request(self, repo_url: str, branch_name: str, title: str, description: str, base_branch: str = "main") -> Dict[str, Any]:
-        """Create a Pull Request using the GitHub Manager"""
-        try:
-            # Note: This method would need to be implemented in GitHubManager
-            # For now, we'll return a placeholder response
-            self.log_message(f"Creating PR: {title} from {branch_name} to {base_branch}")
-            
-            # This would be the actual implementation once GitHubManager is extended
-            return {
-                'status': 'success',
-                'pr_url': f"{repo_url}/pull/123",  # Placeholder
-                'pr_number': 123,  # Placeholder
-                'title': title,
-                'description': description,
-                'branch_name': branch_name,
-                'base_branch': base_branch,
-                'message': 'Pull Request created successfully'
-            }
-            
-        except Exception as e:
-            return {
-                'status': 'error',
-                'error': f'Failed to create Pull Request: {str(e)}'
-            }
-    
-    def validate_changes(self, files_to_change: List[str], proposed_changes: Dict[str, Any]) -> Dict[str, Any]:
-        """Validate proposed changes before creating PR using GitOperations"""
-        try:
-            validation_results = {
-                'valid_files': [],
-                'invalid_files': [],
-                'warnings': [],
-                'overall_status': 'valid'
-            }
-            
-            # Validate file paths using GitOperations
-            for file_path in files_to_change:
-                # Sanitize file path
-                sanitized_path = self.git_operations.sanitize_user_input(file_path, "file_path")
-                
-                # Check file safety
-                is_safe, warning = self.git_operations.check_file_safety(
-                    sanitized_path, 
-                    proposed_changes.get(file_path, "")
-                )
-                
-                if is_safe:
-                    validation_results['valid_files'].append(sanitized_path)
-                    if warning:
-                        validation_results['warnings'].append(f"File {sanitized_path}: {warning}")
-                        validation_results['overall_status'] = 'warning'
-                else:
-                    validation_results['invalid_files'].append(sanitized_path)
-                    validation_results['warnings'].append(f"File {sanitized_path}: {warning}")
-                    validation_results['overall_status'] = 'invalid'
-            
-            # Additional content validation for each file
-            for file_path, content in proposed_changes.items():
-                if isinstance(content, str):
-                    # Check file safety with content
-                    is_safe, warning = self.git_operations.check_file_safety(file_path, content)
-                    if not is_safe and warning:
-                        validation_results['warnings'].append(f"Content validation for {file_path}: {warning}")
-                        if validation_results['overall_status'] != 'invalid':
-                            validation_results['overall_status'] = 'warning'
-            
-            return {
-                'status': 'success',
-                'validation': validation_results
-            }
-            
-        except Exception as e:
-            error_id = self.error_handler.log_error(
-                e, ErrorType.VALIDATION, ErrorSeverity.HIGH,
-                {'operation': 'validate_changes', 'files_count': len(files_to_change)}
-            )
-            return {
-                'status': 'error',
-                'error': f'Validation failed: {str(e)}',
-                'error_id': error_id
-            }
-    
-    def get_workflow_status(self, workflow_id: str) -> Dict[str, Any]:
-        """Get the status of a specific workflow"""
-        if workflow_id in self.active_workflows:
-            return {
-                'status': 'success',
-                'workflow': self.active_workflows[workflow_id]
-            }
-        
-        # Check completed workflows
-        for workflow in self.completed_workflows:
-            if workflow['workflow_id'] == workflow_id:
-                return {
-                    'status': 'success',
-                    'workflow': workflow
-                }
-        
-        return {
-            'status': 'error',
-            'message': f'Workflow {workflow_id} not found'
-        }
-    
-    def _validate_repository_access(self, repo_url: str) -> Dict[str, Any]:
-        """Validate that we have access to the repository using GitOperations"""
-        try:
-            # First validate repository access using GitOperations
-            has_access, access_error = self.git_operations.validate_repository_access(repo_url)
-            
-            if not has_access:
-                return {
-                    'status': 'error',
-                    'message': f"Repository access validation failed: {access_error}"
-                }
-            
-            # Then use GitHub manager to test actual repository access
-            repo_info = self.github_manager.process_task({
-                'action': 'get_repo_summary',
-                'repo_url': repo_url
-            })
-            
-            if repo_info['status'] == 'success':
-                return {
-                    'status': 'success',
-                    'message': 'Repository access validated successfully',
-                    'validation_details': {
-                        'git_operations_check': True,
-                        'github_manager_check': True
-                    }
-                }
-            else:
-                return {
-                    'status': 'error',
-                    'message': f"GitHub Manager validation failed: {repo_info.get('error', 'Unknown error')}",
-                    'validation_details': {
-                        'git_operations_check': True,
-                        'github_manager_check': False
-                    }
-                }
-                
-        except Exception as e:
-            error_id = self.error_handler.log_error(
-                e, ErrorType.GITHUB_API, ErrorSeverity.HIGH,
-                {'operation': 'validate_repository_access', 'repo_url': repo_url}
-            )
-            return {
-                'status': 'error',
-                'message': f'Repository validation failed: {str(e)}',
-                'error_id': error_id
-            }
-    
-    def _add_workflow_step(self, workflow_id: str, step_name: str, result: Dict[str, Any]):
-        """Add a step to the workflow tracking"""
-        if workflow_id in self.active_workflows:
-            step = {
-                'step_name': step_name,
-                'status': result.get('status', 'unknown'),
-                'result': result,
-                'timestamp': datetime.now().isoformat()
-            }
-            
-            self.active_workflows[workflow_id]['steps'].append(step)
-            self.active_workflows[workflow_id]['updated_at'] = datetime.now().isoformat()
-    
-    def _complete_workflow(self, workflow_id: str, status: str, message: str, result: Dict[str, Any] = None) -> Dict[str, Any]:
-        """Complete a workflow and move it to completed workflows"""
-        if workflow_id in self.active_workflows:
-            workflow = self.active_workflows[workflow_id]
-            workflow['status'] = status
-            workflow['completion_message'] = message
-            workflow['completed_at'] = datetime.now().isoformat()
-            
-            if result:
-                workflow['final_result'] = result
-            
-            # Move to completed workflows
-            self.completed_workflows.append(workflow)
-            del self.active_workflows[workflow_id]
-            
-            self.log_message(f"Workflow {workflow_id} completed with status: {status}")
-            
-            return {
-                'status': status,
-                'workflow_id': workflow_id,
-                'message': message,
-                'result': result
-            }
-        
-        return {
-            'status': 'error',
-            'message': f'Workflow {workflow_id} not found'
-        }
-    
-
-    
-    def get_active_workflows(self) -> Dict[str, Any]:
-        """Get all active workflows"""
-        return {
-            'status': 'success',
-            'active_workflows': list(self.active_workflows.keys()),
-            'count': len(self.active_workflows)
-        }
-    
-    def get_completed_workflows(self, limit: int = 10) -> Dict[str, Any]:
-        """Get recent completed workflows"""
-        return {
-            'status': 'success',
-            'completed_workflows': self.completed_workflows[-limit:],
-            'count': len(self.completed_workflows)
-        }
+                # Otherwise, check first non-empty line in code for path header
+                lines = code.splitlines()
+                first = ""
+                for ln in lines:
+                    if ln.strip():
+                        first = ln.strip()
+                        break
+                m2 = re.match(r"(?:(?:#|//)\s*)?(?:path|file)\s*[:=]\s*(.+)", first, re.IGNORECASE)
+                if m2:
+                    path = m2.group(1).strip()
+                    code = "\n".join(lines[1:])  # drop header line
+            if path:
+                files.append({"path": path, "content": code.rstrip() + "\n"})
+        return files

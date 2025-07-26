@@ -1,537 +1,271 @@
-// AI Agents Project - Main JavaScript
-class AIAgentsApp {
-    constructor() {
-        this.systemStatus = 'offline';
-        this.agents = {};
-        this.currentRequest = null;
-        this.progressSteps = ['Repository Analysis', 'Request Analysis', 'Code Planning', 'Implementation'];
-        this.currentStep = 0;
-        
-        this.init();
-    }
-    
-    init() {
-        this.bindEvents();
-        this.checkSystemStatus();
-        this.loadAgentStatuses();
-        this.setupProgressTracking();
-        
-        // Auto-refresh status every 30 seconds
-        setInterval(() => {
-            this.checkSystemStatus();
-            this.loadAgentStatuses();
-        }, 30000);
-        
-        console.log('AI Agents Project initialized');
-    }
-    
-    bindEvents() {
-        // Submit request button
-        document.getElementById('submit-request').addEventListener('click', () => {
-            this.submitRequest();
-        });
-        
-        // Enter key in textarea
-        document.getElementById('user-request').addEventListener('keydown', (e) => {
-            if (e.ctrlKey && e.key === 'Enter') {
-                this.submitRequest();
-            }
-        });
-        
-        // Agent reset buttons
-        document.querySelectorAll('.reset-agent').forEach(button => {
-            button.addEventListener('click', (e) => {
-                const agentCard = e.target.closest('.agent-card');
-                const agentType = agentCard.dataset.agent;
-                this.resetAgent(agentType);
-            });
-        });
-        
-        // Footer links
-        document.getElementById('view-logs').addEventListener('click', (e) => {
-            e.preventDefault();
-            this.viewLogs();
-        });
-        
-        document.getElementById('clear-session').addEventListener('click', (e) => {
-            e.preventDefault();
-            this.clearSession();
-        });
-        
-        // Agent node clicks
-        document.querySelectorAll('.agent-node').forEach(node => {
-            node.addEventListener('click', () => {
-                this.showAgentInfo(node.dataset.agent);
-            });
-        });
-    }
-    
-    async checkSystemStatus() {
-        try {
-            const response = await fetch('/api/status');
-            const data = await response.json();
-            
-            if (response.ok) {
-                this.updateSystemStatus('online', data);
-            } else {
-                this.updateSystemStatus('offline');
-            }
-        } catch (error) {
-            console.error('Error checking system status:', error);
-            this.updateSystemStatus('offline');
-        }
-    }
-    
-    updateSystemStatus(status, data = null) {
-        this.systemStatus = status;
-        const statusDot = document.getElementById('system-status');
-        
-        statusDot.className = `status-dot ${status}`;
-        
-        if (data) {
-            // Update configuration info
-            document.getElementById('max-messages').textContent = data.system.max_messages;
-            
-            const openaiStatus = document.getElementById('openai-status');
-            openaiStatus.textContent = data.openai.api_key_valid ? 'Connected' : 'Disconnected';
-            openaiStatus.className = `status-text ${data.openai.api_key_valid ? 'connected' : 'disconnected'}`;
-            
-            const githubStatus = document.getElementById('github-status');
-            githubStatus.textContent = data.github.token_configured ? 'Configured' : 'Not Configured';
-            githubStatus.className = `status-text ${data.github.token_configured ? 'connected' : 'disconnected'}`;
-        }
-    }
-    
-    async loadAgentStatuses() {
-        const agentTypes = ['project_manager', 'prompt_ask_engineer', 'prompt_code_engineer', 'code_agent', 'github_manager'];
-        
-        for (const agentType of agentTypes) {
-            try {
-                const response = await fetch(`/api/agents/${agentType}/status`);
-                const data = await response.json();
-                
-                if (response.ok) {
-                    this.updateAgentStatus(agentType, data);
-                } else {
-                    this.updateAgentStatus(agentType, null);
-                }
-            } catch (error) {
-                console.error(`Error loading ${agentType} status:`, error);
-                this.updateAgentStatus(agentType, null);
-            }
-        }
-    }
-    
-    updateAgentStatus(agentType, data) {
-        const agentCard = document.querySelector(`[data-agent="${agentType}"]`);
-        if (!agentCard) return;
-        
-        const statusElement = agentCard.querySelector('.agent-status');
-        const messageCountElement = agentCard.querySelector('[data-stat="message_count"]');
-        const temperatureElement = agentCard.querySelector('[data-stat="temperature"]');
-        
-        if (data) {
-            statusElement.textContent = 'Online';
-            statusElement.className = 'agent-status online';
-            messageCountElement.textContent = `${data.message_count}/${data.max_messages}`;
-            temperatureElement.textContent = data.temperature;
-            
-            this.agents[agentType] = data;
-        } else {
-            statusElement.textContent = 'Offline';
-            statusElement.className = 'agent-status offline';
-            messageCountElement.textContent = '-';
-            temperatureElement.textContent = '-';
-        }
-    }
-    
-    async submitRequest() {
-        const userRequest = document.getElementById('user-request').value.trim();
-        const repoUrl = document.getElementById('repo-url').value.trim();
-        
-        if (!userRequest) {
-            this.showToast('Please enter a request', 'error');
-            return;
-        }
-        
-        if (this.systemStatus === 'offline') {
-            this.showToast('System is offline. Please wait for connection.', 'error');
-            return;
-        }
-        
-        // Disable submit button and show progress
-        const submitButton = document.getElementById('submit-request');
-        submitButton.disabled = true;
-        submitButton.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Processing...';
-        
-        this.showProgressSection();
-        this.startProgressAnimation();
-        
-        try {
-            const response = await fetch('/api/process_request', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
-                    request: userRequest,
-                    repo_url: repoUrl || undefined
-                })
-            });
-            
-            const result = await response.json();
-            
-            if (response.ok) {
-                this.showResults(result);
-                this.completeProgress();
-                this.showToast('Request processed successfully!', 'success');
-            } else {
-                throw new Error(result.error || 'Request failed');
-            }
-            
-        } catch (error) {
-            console.error('Error processing request:', error);
-            this.showToast(`Error: ${error.message}`, 'error');
-            this.hideProgressSection();
-        } finally {
-            // Re-enable submit button
-            submitButton.disabled = false;
-            submitButton.innerHTML = '<i class="fas fa-paper-plane"></i> Process Request';
-        }
-    }
-    
-    showProgressSection() {
-        const progressSection = document.getElementById('progress-section');
-        progressSection.style.display = 'block';
-        progressSection.classList.add('fade-in');
-        
-        // Reset progress
-        this.currentStep = 0;
-        this.updateProgressStep();
-    }
-    
-    hideProgressSection() {
-        const progressSection = document.getElementById('progress-section');
-        progressSection.style.display = 'none';
-    }
-    
-    startProgressAnimation() {
-        const progressFill = document.getElementById('progress-fill');
-        const currentStatus = document.getElementById('current-status');
-        
-        let progress = 0;
-        const interval = setInterval(() => {
-            progress += Math.random() * 2;
-            
-            if (progress >= 100) {
-                progress = 100;
-                clearInterval(interval);
-            }
-            
-            progressFill.style.width = `${progress}%`;
-            
-            // Update step based on progress
-            const stepIndex = Math.floor((progress / 100) * this.progressSteps.length);
-            if (stepIndex !== this.currentStep && stepIndex < this.progressSteps.length) {
-                this.currentStep = stepIndex;
-                this.updateProgressStep();
-            }
-        }, 100);
-        
-        this.progressInterval = interval;
-    }
-    
-    updateProgressStep() {
-        const steps = document.querySelectorAll('.step');
-        const currentStatus = document.getElementById('current-status');
-        
-        steps.forEach((step, index) => {
-            step.classList.remove('active', 'completed');
-            if (index < this.currentStep) {
-                step.classList.add('completed');
-            } else if (index === this.currentStep) {
-                step.classList.add('active');
-            }
-        });
-        
-        if (this.currentStep < this.progressSteps.length) {
-            currentStatus.innerHTML = `
-                <i class="fas fa-spinner fa-spin"></i>
-                <span>${this.progressSteps[this.currentStep]}...</span>
-            `;
-        }
-    }
-    
-    completeProgress() {
-        if (this.progressInterval) {
-            clearInterval(this.progressInterval);
-        }
-        
-        const progressFill = document.getElementById('progress-fill');
-        const currentStatus = document.getElementById('current-status');
-        const steps = document.querySelectorAll('.step');
-        
-        progressFill.style.width = '100%';
-        steps.forEach(step => {
-            step.classList.remove('active');
-            step.classList.add('completed');
-        });
-        
-        currentStatus.innerHTML = `
-            <i class="fas fa-check-circle" style="color: #48bb78;"></i>
-            <span>Processing complete!</span>
-        `;
-    }
-    
-    showResults(result) {
-        const resultsSection = document.getElementById('results-section');
-        const resultsContainer = document.getElementById('results-container');
-        
-        let resultsHTML = '';
-        
-        // Status
-        resultsHTML += `
-            <div class="result-item">
-                <div class="result-title">
-                    <i class="fas fa-info-circle"></i> Status: ${result.status}
-                </div>
-                <div class="result-content">${result.message}</div>
-            </div>
-        `;
-        
-        // Changes made
-        if (result.changes_made !== undefined) {
-            resultsHTML += `
-                <div class="result-item">
-                    <div class="result-title">
-                        <i class="fas fa-${result.changes_made ? 'check' : 'times'}-circle"></i> 
-                        Changes Made: ${result.changes_made ? 'Yes' : 'No'}
-                    </div>
-                </div>
-            `;
-        }
-        
-        // Analysis
-        if (result.analysis) {
-            resultsHTML += `
-                <div class="result-item">
-                    <div class="result-title">
-                        <i class="fas fa-search"></i> Analysis
-                    </div>
-                    <div class="result-content">${result.analysis.analysis || 'Analysis completed'}</div>
-                </div>
-            `;
-        }
-        
-        // Code tasks
-        if (result.code_tasks && result.code_tasks.code_tasks) {
-            resultsHTML += `
-                <div class="result-item">
-                    <div class="result-title">
-                        <i class="fas fa-tasks"></i> Code Tasks (${result.code_tasks.code_tasks.length})
-                    </div>
-                    <div class="result-content">
-                        <ul style="margin-left: 20px;">
-                            ${result.code_tasks.code_tasks.map(task => `
-                                <li><strong>${task.title}:</strong> ${task.description}</li>
-                            `).join('')}
-                        </ul>
-                    </div>
-                </div>
-            `;
-        }
-        
-        // Files to change
-        if (result.code_tasks && result.code_tasks.files_to_change && result.code_tasks.files_to_change.length > 0) {
-            resultsHTML += `
-                <div class="result-item">
-                    <div class="result-title">
-                        <i class="fas fa-file-code"></i> Files to Modify
-                    </div>
-                    <div class="result-content">
-                        <ul style="margin-left: 20px;">
-                            ${result.code_tasks.files_to_change.map(file => `<li><code>${file}</code></li>`).join('')}
-                        </ul>
-                    </div>
-                </div>
-            `;
-        }
-        
-        resultsContainer.innerHTML = resultsHTML;
-        resultsSection.style.display = 'block';
-        resultsSection.classList.add('slide-up');
-        
-        // Scroll to results
-        resultsSection.scrollIntoView({ behavior: 'smooth' });
-    }
-    
-    async resetAgent(agentType) {
-        try {
-            const response = await fetch(`/api/agents/${agentType}/reset`, {
-                method: 'POST'
-            });
-            
-            const result = await response.json();
-            
-            if (response.ok) {
-                this.showToast(`${agentType} reset successfully`, 'success');
-                this.loadAgentStatuses(); // Refresh status
-            } else {
-                throw new Error(result.error || 'Reset failed');
-            }
-        } catch (error) {
-            console.error('Error resetting agent:', error);
-            this.showToast(`Error resetting agent: ${error.message}`, 'error');
-        }
-    }
-    
-    async viewLogs() {
-        try {
-            const response = await fetch('/api/logs?lines=100');
-            const data = await response.json();
-            
-            if (response.ok) {
-                this.showLogsModal(data.logs);
-            } else {
-                throw new Error(data.error || 'Failed to load logs');
-            }
-        } catch (error) {
-            console.error('Error loading logs:', error);
-            this.showToast(`Error loading logs: ${error.message}`, 'error');
-        }
-    }
-    
-    showLogsModal(logs) {
-        const modal = document.createElement('div');
-        modal.className = 'modal';
-        modal.innerHTML = `
-            <div class="modal-content" style="max-width: 800px; max-height: 600px;">
-                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
-                    <h3><i class="fas fa-file-alt"></i> System Logs</h3>
-                    <button class="btn btn-secondary btn-small" onclick="this.closest('.modal').remove()">
-                        <i class="fas fa-times"></i> Close
-                    </button>
-                </div>
-                <div class="code-block" style="max-height: 400px; overflow-y: auto;">
-                    ${logs.map(log => `<div>${this.escapeHtml(log)}</div>`).join('')}
-                </div>
-            </div>
-        `;
-        
-        document.body.appendChild(modal);
-    }
-    
-    async clearSession() {
-        if (!confirm('Are you sure you want to clear the current session? This will remove all request history.')) {
-            return;
-        }
-        
-        try {
-            const response = await fetch('/api/session/clear', {
-                method: 'POST'
-            });
-            
-            const result = await response.json();
-            
-            if (response.ok) {
-                this.showToast('Session cleared successfully', 'success');
-                // Clear form
-                document.getElementById('user-request').value = '';
-                // Hide results
-                document.getElementById('results-section').style.display = 'none';
-                document.getElementById('progress-section').style.display = 'none';
-            } else {
-                throw new Error(result.error || 'Clear session failed');
-            }
-        } catch (error) {
-            console.error('Error clearing session:', error);
-            this.showToast(`Error clearing session: ${error.message}`, 'error');
-        }
-    }
-    
-    showAgentInfo(agentType) {
-        const agentData = this.agents[agentType];
-        if (!agentData) {
-            this.showToast('Agent information not available', 'warning');
-            return;
-        }
-        
-        const modal = document.createElement('div');
-        modal.className = 'modal';
-        modal.innerHTML = `
-            <div class="modal-content">
-                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
-                    <h3><i class="fas fa-robot"></i> ${agentType.replace('_', ' ').replace(/\b\w/g, l => l.toUpperCase())}</h3>
-                    <button class="btn btn-secondary btn-small" onclick="this.closest('.modal').remove()">
-                        <i class="fas fa-times"></i> Close
-                    </button>
-                </div>
-                <div class="agent-info">
-                    <p><strong>Status:</strong> Online</p>
-                    <p><strong>Messages:</strong> ${agentData.message_count}/${agentData.max_messages}</p>
-                    <p><strong>Temperature:</strong> ${agentData.temperature}</p>
-                    <p><strong>Model:</strong> ${agentData.model}</p>
-                    <p><strong>Last Activity:</strong> ${agentData.last_activity ? new Date(agentData.last_activity).toLocaleString() : 'None'}</p>
-                </div>
-            </div>
-        `;
-        
-        document.body.appendChild(modal);
-    }
-    
-    setupProgressTracking() {
-        // Initialize progress tracking elements
-        const progressSection = document.getElementById('progress-section');
-        const resultsSection = document.getElementById('results-section');
-        
-        // Initially hide sections
-        progressSection.style.display = 'none';
-        resultsSection.style.display = 'none';
-    }
-    
-    showToast(message, type = 'info') {
-        const toast = document.createElement('div');
-        toast.className = `toast ${type}`;
-        toast.innerHTML = `
-            <div style="display: flex; align-items: center; gap: 10px;">
-                <i class="fas fa-${this.getToastIcon(type)}"></i>
-                <span>${message}</span>
-            </div>
-        `;
-        
-        document.body.appendChild(toast);
-        
-        // Show toast
-        setTimeout(() => toast.classList.add('show'), 100);
-        
-        // Hide and remove toast
-        setTimeout(() => {
-            toast.classList.remove('show');
-            setTimeout(() => toast.remove(), 300);
-        }, 4000);
-    }
-    
-    getToastIcon(type) {
-        const icons = {
-            success: 'check-circle',
-            error: 'exclamation-circle',
-            warning: 'exclamation-triangle',
-            info: 'info-circle'
-        };
-        return icons[type] || icons.info;
-    }
-    
-    escapeHtml(unsafe) {
-        return unsafe
-            .replace(/&/g, "&amp;")
-            .replace(/</g, "&lt;")
-            .replace(/>/g, "&gt;")
-            .replace(/"/g, "&quot;")
-            .replace(/'/g, "&#039;");
-    }
-}
+// static/js/main.js
 
-// Initialize the application when DOM is loaded
 document.addEventListener('DOMContentLoaded', () => {
-    window.aiAgentsApp = new AIAgentsApp();
-});
+    initStatusChecks();
+    bindProcessRequest();
+    bindUtilityLinks();
+    bindAgentResetButtons();
+  });
+  
+  function bindProcessRequest() {
+    const btn = document.getElementById('submit-request');
+    if (btn) btn.addEventListener('click', processRequest);
+  }
+  
+  function bindUtilityLinks() {
+    const viewLogs = document.getElementById('view-logs');
+    if (viewLogs) {
+      viewLogs.addEventListener('click', async (e) => {
+        e.preventDefault();
+        const res = await fetch('/logs');
+        const lines = await res.json().catch(() => []);
+        console.log('--- server logs ---\n' + (lines || []).join('\n'));
+        alert('Logs printed to console.');
+      });
+    }
+    const clearSession = document.getElementById('clear-session');
+    if (clearSession) {
+      clearSession.addEventListener('click', async (e) => {
+        e.preventDefault();
+        const res = await fetch('/api/session/clear', { method: 'POST' });
+        if (res.ok) alert('Session cleared.');
+      });
+    }
+  }
+  
+  function bindAgentResetButtons() {
+    document.querySelectorAll('.agent-card .reset-agent').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const card = btn.closest('.agent-card');
+        const agent = card?.dataset.agent;
+        if (!agent) return;
+        const res = await fetch(`/api/agents/${agent}/reset`, { method: 'POST' });
+        if (!res.ok) return;
+        const statusEl = card.querySelector('.agent-status');
+        if (statusEl) statusEl.textContent = 'Loading...';
+        const msgEl = card.querySelector('[data-stat="message_count"]');
+        const tmpEl = card.querySelector('[data-stat="temperature"]');
+        if (msgEl) msgEl.textContent = '-';
+        if (tmpEl) tmpEl.textContent = '-';
+        checkAgentStatus(agent);
+      });
+    });
+  }
+  
+  // ──────────────────────────────────────────────────────────────
+  // System & Agents
+  // ──────────────────────────────────────────────────────────────
+  
+  async function initStatusChecks() {
+    await checkSystemStatus();
+    const agents = Array.from(document.querySelectorAll('.agent-card'))
+      .map(c => c.dataset.agent)
+      .filter(Boolean);
+    for (const agent of agents) checkAgentStatus(agent);
+  }
+  
+  async function checkSystemStatus() {
+    let dot      = document.getElementById('systemStatusDot') || document.getElementById('system-status');
+    let maxEl    = document.getElementById('maxMessages')     || document.getElementById('max-messages');
+    let openaiEl = document.getElementById('openaiStatus')     || document.getElementById('openai-status');
+    let ghEl     = document.getElementById('githubStatus')     || document.getElementById('github-status');
+  
+    try {
+      const res = await fetch('/api/status');
+      const { system, openai, github } = await res.json();
+      if (dot)   { dot.classList.remove('offline'); dot.classList.add('online'); }
+      if (maxEl) maxEl.textContent = system?.max_messages ?? '';
+      if (openaiEl) openaiEl.textContent = openai?.api_key_valid ? '✔️' : '❌';
+      if (ghEl)     ghEl.textContent     = github?.token_configured ? '✔️' : '❌';
+    } catch {}
+  }
+  
+  async function checkAgentStatus(agentName) {
+    const card = document.querySelector(`.agent-card[data-agent="${agentName}"]`);
+    if (!card) return;
+    const statusEl = card.querySelector('.agent-status');
+  
+    try {
+      const res  = await fetch(`/api/agents/${agentName}/status`);
+      const json = await res.json();
+      if (statusEl) { statusEl.textContent = 'Online'; statusEl.classList.remove('loading'); }
+      const msgs = card.querySelector('[data-stat="message_count"]');
+      const temp = card.querySelector('[data-stat="temperature"]');
+      if (msgs) msgs.textContent = (json.message_count ?? '-').toString();
+      if (temp) temp.textContent = (json.temperature   ?? '-').toString();
+    } catch {
+      if (statusEl) { statusEl.textContent = 'Offline'; statusEl.classList.remove('loading'); }
+    }
+  }
+  
+  // ──────────────────────────────────────────────────────────────
+  // Request → Task → Polling (+ прогрес‑кроки)
+  // ──────────────────────────────────────────────────────────────
+  
+  async function processRequest() {
+    clearToast();
+    const btn = document.getElementById('submit-request');
+    const userRequest = document.getElementById('user-request')?.value || '';
+    const repoUrl     = document.getElementById('repo-url')?.value || '';
+  
+    if (btn) btn.disabled = true;
+    setStep(1, 'Repository Analysis');
+    showProgress(true, 'Submitting request...');
+  
+    hideResultPanel();
+  
+    try {
+      const res  = await fetch('/api/pr/create', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user_request: userRequest, repo_url: repoUrl })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || 'Server error');
+      startTaskPolling(data.task_id);
+    } catch (err) {
+      showToast(`Error: ${err.message}`);
+      showProgress(false);
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+  
+  function startTaskPolling(taskId) {
+    updateProgress(25, 'Queued / Processing...');
+    setStep(2, 'Request Analysis');
+  
+    const timer = setInterval(async () => {
+      try {
+        const res = await fetch(`/api/async/task/${taskId}/status`);
+        const data = await res.json();
+  
+        if (data.status === 'processing') {
+          updateProgress(60, 'Generating code...');
+          setStep(3, 'Code Planning');
+        }
+  
+        if (data.status === 'completed' || data.status === 'failed') {
+          clearInterval(timer);
+          if (data.status === 'completed') {
+            updateProgress(100, 'Completed');
+            setStep(4, 'Implementation');
+            renderResult(data.result || {});
+            showToast('PR workflow completed');
+          } else {
+            showProgress(false);
+            showToast(`PR failed: ${data.error || 'Unknown error'}`);
+          }
+        }
+      } catch (e) {
+        clearInterval(timer);
+        showProgress(false);
+        showToast(`Polling error: ${e.message}`);
+      }
+    }, 1200);
+  }
+  
+  function setStep(stepNumber, label) {
+    const sec = document.getElementById('progress-section');
+    if (!sec) return;
+    const steps = Array.from(sec.querySelectorAll('.progress-steps .step'));
+    steps.forEach((el, idx) => {
+      el.classList.toggle('active', (idx + 1) <= stepNumber);
+    });
+    const cur = document.getElementById('current-status');
+    if (cur) cur.querySelector('span').textContent = label;
+  }
+  
+  function showProgress(show, label = 'Processing...') {
+    const section = document.getElementById('progress-section');
+    const cur = document.getElementById('current-status');
+    if (!section || !cur) return;
+    section.style.display = show ? 'block' : 'none';
+    if (show) cur.querySelector('span').textContent = label;
+  }
+  
+  function updateProgress(percent, label) {
+    const fill = document.getElementById('progress-fill');
+    const cur = document.getElementById('current-status');
+    if (!fill || !cur) return;
+    fill.style.width = Math.max(0, Math.min(100, percent)) + '%';
+    if (label) cur.querySelector('span').textContent = label;
+  }
+  
+  // ──────────────────────────────────────────────────────────────
+  // Result panel
+  // ──────────────────────────────────────────────────────────────
+  
+  function hideResultPanel() {
+    const p = document.getElementById('result-panel');
+    if (p) p.style.display = 'none';
+  }
+  
+  function renderResult(result) {
+    const panel = document.getElementById('result-panel');
+    const list  = document.getElementById('result-file-list');
+    const title = document.getElementById('result-title');
+    const code  = document.getElementById('result-code');
+    const prBox = document.getElementById('result-pr');
+  
+    if (!panel || !list || !title || !code || !prBox) return;
+  
+    prBox.innerHTML = '';
+    if (result.pr_result?.created && result.pr_result?.pr_url) {
+      const a = document.createElement('a');
+      a.href = result.pr_result.pr_url;
+      a.target = '_blank';
+      a.rel = 'noopener';
+      a.textContent = 'View Pull Request';
+      prBox.appendChild(a);
+    } else if (result.pr_result?.error) {
+      prBox.textContent = `PR not created: ${result.pr_result.error}`;
+    } else {
+      prBox.textContent = 'PR not created (no GitHub token or error).';
+    }
+  
+    list.innerHTML = '';
+    const files = result.generated_files || [];
+    if (!files.length) {
+      title.textContent = 'No files generated';
+      code.textContent = '';
+      panel.style.display = 'block';
+      return;
+    }
+  
+    files.forEach((f, idx) => {
+      const li = document.createElement('li');
+      const btn = document.createElement('button');
+      btn.className = 'button is-small';
+      btn.textContent = f.path;
+      btn.addEventListener('click', () => {
+        title.textContent = f.path;
+        code.textContent = f.content || '';
+      });
+      li.appendChild(btn);
+      list.appendChild(li);
+      if (idx === 0) {
+        title.textContent = f.path;
+        code.textContent = f.content || '';
+      }
+    });
+  
+    panel.style.display = 'block';
+  }
+  
+  // ──────────────────────────────────────────────────────────────
+  function clearToast() {
+    const t = document.getElementById('toast');
+    if (t) t.remove();
+  }
+  function showToast(msg) {
+    let toast = document.getElementById('toast');
+    if (!toast) {
+      toast = document.createElement('div');
+      toast.id = 'toast';
+      toast.className = 'notification is-danger';
+      document.body.appendChild(toast);
+    }
+    toast.textContent = msg;
+  }
+  

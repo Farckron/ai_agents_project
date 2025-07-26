@@ -1,2 +1,21 @@
-logs/
+# Environment files
+.env
+.env.*                # any other .env variants
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual‑env folders
 .venv/
+venv/
+env/
+
+# Logs
+logs/
+*.log
+
+# IDE settings
+.vscode/
